@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List, Literal, Union
 from urllib.parse import urljoin, urlsplit
 
-from requests import Session, request
+from requests import HTTPError, Session, request
 
 from .utils import download_file
 
@@ -24,6 +24,12 @@ def revise_file_path(file_path: str) -> str:
 def uris_to_list(uris: Union[str, List[str]]) -> List[str]:
     _items = uris if type(uris) is list else [uris]
     return [revise_file_path(i) for i in _items]
+
+
+class CloudreveError(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f'Cloudreve error code={code}')
 
 
 class CloudreveV4:
@@ -69,11 +75,14 @@ class CloudreveV4:
             target = url
         else:
             target = self.base_url + url
-        r = self.session.request(method, target, **kwargs)
-        r = r.json()
-
+        kwargs.setdefault('timeout', (10, 120))
+        kwargs.setdefault('allow_redirects', False)
+        with self.session.request(method, target, **kwargs) as response:
+            if not 200 <= response.status_code < 300:
+                raise HTTPError(f'Cloudreve HTTP {response.status_code}', response=response)
+            r = response.json()
         if r['code'] != 0:
-            raise Exception(f'{r["code"]}: {r["msg"]}')
+            raise CloudreveError(r['code'])
 
         return r.get('data')
 
@@ -158,7 +167,16 @@ class CloudreveV4:
         @param save_path: 保存路径
         '''
         download_url = self.get_download_url(revise_file_path(file_uri))
-        download_file(download_url, save_path, self.session)
+        if urlsplit(download_url)[:2] == urlsplit(self.base_url)[:2]:
+            download_file(download_url, save_path, self.session,
+                          timeout=(10, 120), allow_redirects=False)
+        else:
+            # Signed storage URLs must not receive Cloudreve credentials.
+            with Session() as session:
+                session.verify = self.session.verify
+                session.proxies.update(self.session.proxies)
+                download_file(download_url, save_path, session,
+                              timeout=(10, 120), allow_redirects=False)
 
     def get_source_url(self, uris):
         '''
@@ -255,19 +273,19 @@ class CloudreveV4:
     def delete(self,
                uris: Union[str, List[str]],
                unlink=False,
-               trash_bin=False):
+               trash_bin=True):
         '''
         删除文件或文件夹
         @param uris(str|list): 文件URI
         @param unlink: 仅解除链接
-        @param trash_bin: 是否移动至回收站
+        @param trash_bin: 默认移入回收站；False 永久删除
         '''
         return self.request('delete',
                             '/file',
                             json={
                                 'uris': uris_to_list(uris),
                                 'unlink': unlink,
-                                'trash_bin': trash_bin
+                                'skip_soft_delete': not trash_bin
                             })
 
     remove = delete
@@ -318,22 +336,23 @@ class CloudreveV4:
 
     def _upload_to_local(self, local_file: Path, session_id, chunk_size,
                          **kwards):
+        if not isinstance(chunk_size, int) or chunk_size < 0:
+            raise ValueError('Invalid upload chunk size')
+        size = local_file.stat().st_size
         with open(local_file, 'rb') as file:
-            block_id = 0
-            while True:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    break
+            # Relay chunk_size=0 means one streaming request, including empty files.
+            count = max(1, (size + chunk_size - 1) // chunk_size) if chunk_size else 1
+            for block_id in range(count):
+                chunk = file.read(chunk_size) if chunk_size else (file if size else b'')
                 self.request(
                     'post',
                     f'/file/upload/{session_id}/{block_id}',
                     headers={
-                        'Content-Length': str(len(chunk)),
+                        'Content-Length': str(len(chunk) if chunk_size else size),
                         'Content-Type': 'application/octet-stream',
                     },
                     data=chunk,
                 )
-                block_id += 1
 
     def _upload_to_remote_direct(self, local_file: Path, session_id,
                                  chunk_size, upload_urls, credential,
@@ -411,11 +430,12 @@ class CloudreveV4:
                 )
         request('post', completeURL)
 
-    def upload(self, local_file_path, uri):
+    def upload(self, local_file_path, uri, previous=None):
         '''
         上传文件
         @param local_file_path: 本地文件路径
         @param uri: 文件目标路径（包含文件名）
+        @param previous: 覆盖时传当前文件的 primary_entity；省略则创建新文件
         '''
         local_file = Path(local_file_path)
         if not local_file.is_file():
@@ -427,43 +447,44 @@ class CloudreveV4:
         dir = uri[:uri.rfind('/')]
         policy = self.list(dir)['storage_policy']
         policy_id, policy_type = policy['id'], policy['type']
+        if not policy.get('relay') and policy_type not in ('local', 'remote', 'onedrive'):
+            raise ValueError(f'存储策略 {policy_type} 需要启用中转上传')
+        if previous is not None and (not isinstance(previous, str) or not previous):
+            raise ValueError('Previous version must be a nonempty entity ID')
 
         mime_type, _ = guess_type(local_file.name)
         size = local_file.stat().st_size
         time = int(local_file.stat().st_mtime * 1000)
 
-        r = self.request('put',
-                         '/file/upload',
-                         json={
-                             'uri': uri,
-                             'size': size,
-                             'last_modified': time,
-                             'policy_id': policy_id,
-                             'mime_type': mime_type
-                         })
-
-        if policy_type == 'remote' and r.get('upload_urls') and len(
-                r['upload_urls']) > 0:
-            # Remote 直传模式
-            return self._upload_to_remote_direct(
-                local_file=local_file,
-                **r,
-            )
-        elif policy_type == 'local' or policy_type == 'remote':
-            # Local 或 Relay 模式
-            return self._upload_to_local(
-                local_file=local_file,
-                **r,
-            )
-        elif policy_type == 'onedrive':
-            return self._upload_to_onedrive(
-                local_file=local_file,
-                **r,
-            )
-        # elif policy_type == 'oss':
-        #     return self._upload_to_oss(
-        #         local_file=local_file,
-        #         **r,
-        #     )
-        else:
-            raise ValueError(f'存储策略 {policy_type} 暂时不受支持')
+        body = {
+            'uri': uri,
+            'size': size,
+            'last_modified': time,
+            'policy_id': policy_id,
+            'mime_type': mime_type,
+        }
+        if previous is not None:
+            body.update(previous=previous, entity_type='version')
+        r = self.request('put', '/file/upload', json=body)
+        try:
+            session_policy = r.get('storage_policy', policy)
+            policy_type = session_policy['type']
+            if session_policy.get('relay') or policy_type == 'local':
+                self._upload_to_local(local_file=local_file, **r)
+            elif policy_type == 'remote':
+                if r.get('upload_urls'):
+                    self._upload_to_remote_direct(local_file=local_file, **r)
+                else:
+                    self._upload_to_local(local_file=local_file, **r)
+            elif policy_type == 'onedrive':
+                self._upload_to_onedrive(local_file=local_file, **r)
+            else:
+                raise ValueError(f'存储策略 {policy_type} 暂时不受支持')
+            if self.get_info(uri)['size'] != size:
+                raise ValueError('Uploaded size differs from source')
+        except BaseException as error:
+            try:
+                self.request('delete', '/file/upload', json={'id': r['session_id'], 'uri': uri})
+            except Exception as cleanup_error:
+                raise error from cleanup_error
+            raise

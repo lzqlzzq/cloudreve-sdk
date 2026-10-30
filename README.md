@@ -31,13 +31,23 @@ pip3 install cloudreve
 | 获取分享链接         | ✅           | ✅             |
 | 上传文件（本地存储） | ✅           | ✅             |
 | 上传文件（OneDrive） | ✅           | ✅             |
-| 上传文件（OSS）      | 待测试      | 待测试        |
+| 上传文件（OSS）      | 待测试      | 中转支持；直传未开放 |
 | 上传文件（从机模式） | ❌           | ✅（未经测试） |
 
 说明：
 
 - V4 版本使用 URI 来标识文件和目录，不再需要文件ID。
 - “待测试”表示该功能已实现，但由于缺乏测试环境，暂未进行测试，也没有公开使用。如果你使用该存储方案搭建 Cloudreve V4，并且愿意协助测试该功能，请您联系我。
+
+### 本地 V4 文件操作修复
+
+- `upload()` 支持策略已开启的 relay 上传，包括 OSS；`chunk_size=0` 流式发送整文件，空文件也发送完成请求。SDK 不创建策略或修改权限。
+- 覆盖文件使用 `upload(local_path, uri, previous=conn.get_info(uri)['primary_entity'])`。旧版本冲突通过 `CloudreveError.code` 传给调用方；上传失败尝试取消已知会话，不自动重试。
+- API 请求检查 HTTP 和业务错误码，默认连接／读超时为 10／120 秒，禁止自动重定向。下载仍以临时文件加原子替换保护现有目标文件；跨域下载不携带 CR 鉴权。
+- **删除默认进入回收站**：`delete(uri)` 的 `trash_bin` 默认值改为 `True`，保留此前服务端的实际软删除行为。显式 `delete(uri, trash_bin=False)` 现在通过 V4 `skip_soft_delete=true` 实现永久删除；此前该参数被服务端忽略。
+- OSS 直传保持未开放；权限和中转策略由部署侧配置。
+
+从 SDK 目录运行离线测试：`uv run --with-editable . python -m unittest discover -s tests -v`。
 
 ## 示例（V3）
 
