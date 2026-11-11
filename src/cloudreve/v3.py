@@ -1,9 +1,8 @@
 from pathlib import Path
 
-from requests import Session, request
 from urllib.parse import quote_plus, urljoin
 
-from .utils import download_file
+from .transport import Client
 
 
 def generate_src(file_id, is_dir) -> dict:
@@ -26,51 +25,8 @@ def revise_file_path(file_path: str) -> str:
     return file_path.rstrip('/') or '/'
 
 
-class Cloudreve:
-    session: Session
-    user: dict
-
-    def __init__(self,
-                 base_url: str = 'http://127.0.0.1:5212',
-                 proxy=None,
-                 verify=True,
-                 headers=None,
-                 cloudreve_session=None):
-        '''
-        @param base_url(str): Cloudreve站点地址
-        @param proxy(dict|str|None): 代理
-        @param verify(bool): 是否验证ssl证书
-        @param headers(dict|None): 自定义请求头
-        @param cloudreve_session(str|None): Cloudreve会话ID，提供后可无需调用登录接口
-        '''
-
-        while base_url.endswith('/'):
-            base_url = base_url[:-1]
-        if not base_url.endswith('/api/v3'):
-            base_url += '/api/v3'
-        self.base_url = base_url
-
-        self.session = Session()
-        self.session.verify = verify
-        if proxy is not None:
-            if type(proxy) == str:
-                self.session.proxies = {'http': proxy, 'https': proxy}
-            elif type(proxy) == dict:
-                self.session.proxies = proxy
-        if cloudreve_session is not None:
-            self.session.cookies.update(
-                {'cloudreve-session': cloudreve_session})
-        if type(headers) == dict:
-            self.session.headers.update(headers)
-
-    def request(self, method, url, **kwargs):
-        r = self.session.request(method, self.base_url + url, **kwargs)
-        r = r.json()
-
-        if r['code'] != 0:
-            raise Exception(f'{r["code"]}: {r["msg"]}')
-
-        return r.get('data')
+class Cloudreve(Client):
+    api_version = "v3"
 
     def login(self, email, password):
         '''
@@ -87,6 +43,8 @@ class Cloudreve:
                              'captchaCode': ''
                          })
         self.user = r
+        with self._lock:
+            self._template.cookies.update(self.session.cookies)
 
     def list(self, path='/'):
         '''
@@ -163,7 +121,7 @@ class Cloudreve:
         @param save_path: 保存路径
         '''
         download_url = self.get_download_url(file_id)
-        download_file(download_url, save_path, self.session)
+        self._download(download_url, save_path)
 
     def get_source_url(self, file_id, url_only=True):
         '''
@@ -334,74 +292,23 @@ class Cloudreve:
         self.request('put', '/directory', json={'path': dir_path})
 
     def upload_to_local(self, local_file: Path, sessionID, chunkSize, expires):
-        with open(local_file, 'rb') as file:
-            block_id = 0
-            while True:
-                chunk = file.read(chunkSize)
-                if not chunk:
-                    break
+        if type(chunkSize) is not int or chunkSize < 0:
+            raise ValueError('Invalid upload chunk size')
+        size = local_file.stat().st_size
+        with local_file.open('rb') as file:
+            count = max(1, (size + chunkSize - 1) // chunkSize) if chunkSize else 1
+            for block_id in range(count):
+                chunk = file.read(chunkSize) if chunkSize else (file if size else b'')
+                self.request('post', f'/file/upload/{sessionID}/{block_id}',
+                             headers={'Content-Length': str(len(chunk) if chunkSize else size),
+                                      'Content-Type': 'application/octet-stream'}, data=chunk)
 
-                self.request(
-                    'post',
-                    f'/file/upload/{sessionID}/{block_id}',
-                    headers={
-                        'Content-Length': str(len(chunk)),
-                        'Content-Type': 'application/octet-stream',
-                    },
-                    data=chunk,
-                )
-
-                block_id += 1
-
-    def upload_to_onedrive(self, local_file: Path, sessionID, chunkSize,
-                           expires, uploadURLs):
-        upload_url = uploadURLs[0]
-        file_size = local_file.stat().st_size
-        with open(local_file, 'rb') as file:
-            for i in range(0, file_size, chunkSize):
-                start = i
-                end = min(i + chunkSize, file_size) - 1
-                response = request(
-                    'put',
-                    upload_url,
-                    headers={
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    },
-                    data=file.read(chunkSize),
-                )
-                try:
-                    response.raise_for_status()
-                finally:
-                    response.close()
+    def upload_to_onedrive(self, local_file: Path, sessionID, chunkSize, expires, uploadURLs):
+        self._onedrive_chunks(local_file, chunkSize, uploadURLs[0])
         self.request('post', f'/callback/onedrive/finish/{sessionID}', json={})
 
-    def upload_to_oss(
-        self,
-        local_file: Path,
-        sessionID,
-        chunkSize,
-        expires,
-        uploadURLs,
-        completeURL,
-        **kwards,
-    ):
-        upload_url = uploadURLs[0]
-        file_size = local_file.stat().st_size
-        with open(local_file, 'rb') as file:
-            for i in range(0, file_size, chunkSize):
-                start = i
-                end = min(i + chunkSize, file_size) - 1
-                r = request(
-                    'put',
-                    upload_url,
-                    headers={
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    },
-                    data=file.read(chunkSize),
-                )
-        request('post', completeURL)
+    def upload_to_oss(self, *args, **kwargs):
+        raise NotImplementedError('OSS direct upload is not supported')
 
     def upload(self,
                file_path,
@@ -431,6 +338,11 @@ class Cloudreve:
             policy = self.list(dir)['policy']
             policy_id, policy_type = policy['id'], policy['type']
 
+        if policy_type not in ('local', 'onedrive'):
+            raise ValueError(f'Unsupported storage policy: {policy_type}')
+        if policy_type == 'onedrive' and local_file.stat().st_size == 0:
+            raise ValueError('OneDrive direct upload does not support empty files')
+
         body = {
             'path': dir,
             'name': name,
@@ -452,10 +364,5 @@ class Cloudreve:
                 local_file=local_file,
                 **r,
             )
-        # elif policy_type == 'oss':
-        #     return self.upload_to_oss(
-        #         local_file=local_file,
-        #         **r,
-        #     )
         else:
             raise ValueError(f'存储策略 {policy_type} 暂时不受支持')

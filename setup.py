@@ -24,6 +24,7 @@ setup(
     author_email='yxzlwz@gmail.com',
     install_requires=[
         'requests',
+        'httpx>=0.27,<1',
     ],
     classifiers=[
         'Development Status :: 5 - Production/Stable',

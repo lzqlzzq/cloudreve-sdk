@@ -1,24 +1,24 @@
+import base64
+import json
+import re
+from datetime import datetime, timezone
 from mimetypes import guess_type
 from pathlib import Path
 from typing import List, Literal, Union
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
-from requests import HTTPError, Session, request
-
-from .utils import download_file
+from .transport import Client, CloudreveError, origin, response_data
 
 
 def revise_file_path(file_path: str) -> str:
-    if not file_path:
-        raise ValueError('File path must not be empty')
+    if not isinstance(file_path, str) or not file_path:
+        raise ValueError('File path must be a nonempty string')
     if not file_path.startswith('cloudreve://'):
-        if not file_path.startswith('/'):
-            file_path = '/' + file_path
-        file_path = 'cloudreve://my' + file_path
-
-    if not urlsplit(file_path).path.strip('/'):
-        return file_path.rstrip('/') + '/'
-    return file_path.rstrip('/')
+        file_path = 'cloudreve://my/' + quote(file_path.lstrip('/'), safe='/')
+    parsed = urlsplit(file_path)
+    if not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError('Cloudreve URI must have an authority and no credentials or fragment')
+    return parsed._replace(path=parsed.path.rstrip('/') or '/').geturl()
 
 
 def uris_to_list(uris: Union[str, List[str]]) -> List[str]:
@@ -26,82 +26,84 @@ def uris_to_list(uris: Union[str, List[str]]) -> List[str]:
     return [revise_file_path(i) for i in _items]
 
 
-class CloudreveError(Exception):
-    def __init__(self, code):
-        self.code = code
-        super().__init__(f'Cloudreve error code={code}')
+def check_source_unchanged(path, before):
+    after = path.stat()
+    if any(getattr(before, field) != getattr(after, field)
+           for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')):
+        raise ValueError('Source file changed during upload; verify the remote result')
 
 
-class CloudreveV4:
-    session: Session
-    user: dict
-    refresh_token: Union[str, None] = None
+def token_values(token):
+    access, refresh = token['access_token'], token['refresh_token']
+    expires = token.get('access_expires')
+    # Go emits nanoseconds; Python 3.8–3.10 accepts only microseconds.
+    normalized = re.sub(r'\.(\d+)', lambda m: '.' + m[1][:6].ljust(6, '0'), expires).replace('Z', '+00:00') if expires else None
+    deadline = datetime.fromisoformat(normalized).timestamp() if normalized else None
+    if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh:
+        raise ValueError('Invalid access or refresh token')
+    return access, refresh, deadline
 
-    def __init__(self,
-                 base_url: str = 'http://127.0.0.1:5212',
-                 proxy=None,
-                 verify=True,
-                 headers=None,
-                 cloudreve_session=None):
-        '''
-        @param base_url(str): Cloudreve站点地址
-        @param proxy(dict|str|None): 代理
-        @param verify(bool): 是否验证ssl证书
-        @param headers(dict|None): 自定义请求头
-        @param cloudreve_session(str|None): Cloudreve会话ID，提供后可无需调用登录接口
-        '''
 
-        while base_url.endswith('/'):
-            base_url = base_url[:-1]
-        if not base_url.endswith('/api/v4'):
-            base_url += '/api/v4'
-        self.base_url = base_url
+def fix_list_cursor(result):
+    pagination = result.get('pagination', {})
+    token = pagination.get('next_token')
+    files = result.get('files', [])
+    if token and pagination.get('is_cursor') and not result.get('mixed_type') and files and files[-1]['type'] == 1:
+        # shortcut: V4 folder-boundary cursors skip older files; remove when upstream fixes its flag.
+        try:
+            cursor = json.loads(base64.b64decode(token, validate=True))
+        except (ValueError, UnicodeError):
+            cursor = None
+        if isinstance(cursor, dict) and cursor.get('start_with_file') and cursor.get('id') == files[-1]['id']:
+            cursor['start_with_file'] = False
+            pagination['next_token'] = base64.b64encode(json.dumps(cursor).encode()).decode()
+    return result
 
-        self.session = Session()
-        self.session.verify = verify
-        if proxy is not None:
-            if type(proxy) is str:
-                self.session.proxies = {'http': proxy, 'https': proxy}
-            elif type(proxy) is dict:
-                self.session.proxies = proxy
-        if cloudreve_session is not None:
-            self.session.cookies.update(
-                {'cloudreve-session': cloudreve_session})
-        if type(headers) is dict:
-            self.session.headers.update(headers)
 
-    def request(self, method, url, **kwargs):
-        if urlsplit(url).scheme in ('http', 'https'):
-            target = url
-        else:
-            target = self.base_url + url
-        kwargs.setdefault('timeout', (10, 120))
-        kwargs.setdefault('allow_redirects', False)
-        with self.session.request(method, target, **kwargs) as response:
-            if not 200 <= response.status_code < 300:
-                raise HTTPError(f'Cloudreve HTTP {response.status_code}', response=response)
-            r = response.json()
-        if r['code'] != 0:
-            raise CloudreveError(r['code'])
+class CloudreveV4(Client):
+    api_version = "v4"
 
-        return r.get('data')
+    refresh_token = None
+    _access_expires = None
+    _refresh_error = None
+
+    def _set_token(self, token):
+        access, refresh, deadline = token_values(token)
+        self._template.headers['Authorization'] = 'Bearer ' + access
+        self.refresh_token, self._access_expires = refresh, deadline
+        self._refresh_error = None
 
     def login(self, email, password):
-        '''
-        登录（请在执行其他操作前调用此方法）
-        @param email: 邮箱
-        @param password: 密码
-        '''
-        r = self.request('post',
-                         '/session/token',
-                         json={
-                             'email': email,
-                             'password': password,
-                         })
-        self.user = r['user']
-        self.session.headers.update(
-            {'Authorization': 'Bearer ' + r['token']['access_token']})
-        self.refresh_token = r['token']['refresh_token']
+        """Log in before starting workers. Credentials are not retained by the SDK."""
+        with self._lock:
+            result = super().request('post', '/session/token',
+                                     json={'email': email, 'password': password})
+            self._set_token(result['token'])
+            self.user = result['user']
+
+    def refresh_access_token(self):
+        """Refresh once, without retrying a possibly rotated refresh token."""
+        with self._lock:
+            if not self.refresh_token:
+                raise ValueError('No refresh token; log in first')
+            try:
+                result = super().request('post', '/session/token/refresh',
+                                         json={'refresh_token': self.refresh_token})
+                self._set_token(result)
+            except Exception as error:
+                # A lost response may already have rotated the token; workers must not replay it.
+                self._refresh_error = error
+                raise
+
+    def request(self, method, url, **kwargs):
+        with self._lock:
+            if (not url.startswith('/session/') and self.refresh_token
+                    and self._access_expires is not None
+                    and datetime.now(timezone.utc).timestamp() >= self._access_expires - 30):
+                if self._refresh_error is not None:
+                    raise self._refresh_error
+                self.refresh_access_token()
+        return super().request(method, url, **kwargs)
 
     def list(self,
              uri='/',
@@ -119,16 +121,18 @@ class CloudreveV4:
             - files: 文件列表
             - storage_policy: 文件存储策略
         '''
-        return self.request('get',
+        result = self.request('get',
                             '/file',
                             params={
                                 'uri': revise_file_path(uri),
                                 'page': page,
                                 'page_size': page_size,
                                 'order_by': order_by,
-                                'order': order,
+                                'order_direction': order,
                                 'next_page_token': next_page_token
                             })
+
+        return fix_list_cursor(result)
 
     def get_info(self, file_uri):
         '''
@@ -166,24 +170,13 @@ class CloudreveV4:
         @param file_uri: 文件URI
         @param save_path: 保存路径
         '''
-        download_url = self.get_download_url(revise_file_path(file_uri))
-        if urlsplit(download_url)[:2] == urlsplit(self.base_url)[:2]:
-            download_file(download_url, save_path, self.session,
-                          timeout=(10, 120), allow_redirects=False)
-        else:
-            # Signed storage URLs must not receive Cloudreve credentials.
-            with Session() as session:
-                session.verify = self.session.verify
-                session.proxies.update(self.session.proxies)
-                download_file(download_url, save_path, session,
-                              timeout=(10, 120), allow_redirects=False)
+        self._download(self.get_download_url(file_uri), save_path)
 
     def get_source_url(self, uris):
         '''
         获取文件直链
         @param uris(str|list): 文件URL，可传递列表
-        @return: 直链列表，若link_only=True，则列表项为字符串；否则返回包含file_url和link的字典列表。
-        请注意：由于Cloudreve API设计问题，传入的文件URL为列表时，返回的数据无序且不包含file_uri。因此请勿在同时获取多个直链时启用link_only。
+        @return: 单个 URI 返回链接字符串；列表返回服务端的无序链接信息列表。
         '''
         is_list = type(uris) is list
         r = self.request('put',
@@ -259,16 +252,20 @@ class CloudreveV4:
 
     create_dir = create_directory = create_folder
 
-    def update_file_content(self, file_uri, content):
+    def update_file_content(self, file_uri, content, previous=None):
         '''
         更新文本文件内容
         @param file_uri: 文件URI
         @param content: 新内容
+        @param previous: 可选的当前 primary_entity，用于防止覆盖并发更新
         '''
-        return self.request('put',
-                            '/file/content',
-                            params={'uri': revise_file_path(file_uri)},
-                            data=content)
+        params = {'uri': revise_file_path(file_uri)}
+        if previous is not None:
+            if not isinstance(previous, str) or not previous:
+                raise ValueError('Previous version must be a nonempty entity ID')
+            params['previous'] = previous
+        return self.request('put', '/file/content', params=params,
+                            data=content.encode('utf-8') if isinstance(content, str) else content)
 
     def delete(self,
                uris: Union[str, List[str]],
@@ -336,7 +333,7 @@ class CloudreveV4:
 
     def _upload_to_local(self, local_file: Path, session_id, chunk_size,
                          **kwards):
-        if not isinstance(chunk_size, int) or chunk_size < 0:
+        if type(chunk_size) is not int or chunk_size < 0:
             raise ValueError('Invalid upload chunk size')
         size = local_file.stat().st_size
         with open(local_file, 'rb') as file:
@@ -355,80 +352,28 @@ class CloudreveV4:
                 )
 
     def _upload_to_remote_direct(self, local_file: Path, session_id,
-                                 chunk_size, upload_urls, credential,
-                                 **kwards):
-        base_upload_url = upload_urls[0]
-
-        headers = {
-            'Content-Type': 'application/octet-stream',
-            'Authorization': credential,
-        }
-
-        with open(local_file, 'rb') as file:
-            block_id = 0
-            chunk = file.read(chunk_size)
-            while chunk:
-                headers['Content-Length'] = str(len(chunk))
-
-                self.request('post',
-                             base_upload_url,
-                             params={'chunk': block_id},
-                             headers=headers,
-                             data=chunk)
-
-                block_id += 1
-                chunk = file.read(chunk_size)
+                                 chunk_size, upload_urls, credential, **kwargs):
+        if type(chunk_size) is not int or chunk_size < 0:
+            raise ValueError('Invalid upload chunk size')
+        size = local_file.stat().st_size
+        url = upload_urls[0]
+        origin(url)
+        with local_file.open('rb') as file:
+            count = max(1, (size + chunk_size - 1) // chunk_size) if chunk_size else 1
+            for index in range(count):
+                chunk = file.read(chunk_size) if chunk_size else (file if size else b'')
+                with self._send(self._external_session(), 'post', url,
+                                params={'chunk': index},
+                                headers={'Authorization': credential,
+                                         'Content-Type': 'application/octet-stream',
+                                         'Content-Length': str(len(chunk) if chunk_size else size)},
+                                data=chunk) as response:
+                    response_data(response)
 
     def _upload_to_onedrive(self, local_file: Path, session_id, chunk_size,
-                            upload_urls, callback_secret, **kwards):
-        upload_url = upload_urls[0]
-        file_size = local_file.stat().st_size
-        with open(local_file, 'rb') as file:
-            for i in range(0, file_size, chunk_size):
-                start = i
-                end = min(i + chunk_size, file_size) - 1
-                response = request(
-                    'put',
-                    upload_url,
-                    headers={
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    },
-                    data=file.read(chunk_size),
-                )
-                try:
-                    response.raise_for_status()
-                finally:
-                    response.close()
-        self.request('post',
-                     f'/callback/onedrive/{session_id}/{callback_secret}')
-
-    def _upload_to_oss(
-        self,
-        local_file: Path,
-        sessionID,
-        chunkSize,
-        expires,
-        uploadURLs,
-        completeURL,
-        **kwards,
-    ):
-        upload_url = uploadURLs[0]
-        file_size = local_file.stat().st_size
-        with open(local_file, 'rb') as file:
-            for i in range(0, file_size, chunkSize):
-                start = i
-                end = min(i + chunkSize, file_size) - 1
-                request(
-                    'put',
-                    upload_url,
-                    headers={
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Range': f'bytes {start}-{end}/{file_size}',
-                    },
-                    data=file.read(chunkSize),
-                )
-        request('post', completeURL)
+                            upload_urls, callback_secret, **kwargs):
+        self._onedrive_chunks(local_file, chunk_size, upload_urls[0])
+        self.request('post', f'/callback/onedrive/{session_id}/{callback_secret}')
 
     def upload(self, local_file_path, uri, previous=None):
         '''
@@ -453,8 +398,11 @@ class CloudreveV4:
             raise ValueError('Previous version must be a nonempty entity ID')
 
         mime_type, _ = guess_type(local_file.name)
-        size = local_file.stat().st_size
-        time = int(local_file.stat().st_mtime * 1000)
+        stat = local_file.stat()
+        size = stat.st_size
+        if policy_type == 'onedrive' and not policy.get('relay') and size == 0:
+            raise ValueError('OneDrive direct upload does not support empty files')
+        time = int(stat.st_mtime * 1000)
 
         body = {
             'uri': uri,
@@ -480,11 +428,15 @@ class CloudreveV4:
                 self._upload_to_onedrive(local_file=local_file, **r)
             else:
                 raise ValueError(f'存储策略 {policy_type} 暂时不受支持')
+            check_source_unchanged(local_file, stat)
             if self.get_info(uri)['size'] != size:
                 raise ValueError('Uploaded size differs from source')
         except BaseException as error:
+            error.upload_session_id = r.get('session_id')
+            error.upload_uri = uri
             try:
                 self.request('delete', '/file/upload', json={'id': r['session_id'], 'uri': uri})
             except Exception as cleanup_error:
+                error.cleanup_error = cleanup_error
                 raise error from cleanup_error
             raise

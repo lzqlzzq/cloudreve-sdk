@@ -5,3 +5,5 @@ dist/
 
 *.bat
 *.local.*
+.env
+.venv/
