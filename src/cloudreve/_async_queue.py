@@ -69,9 +69,9 @@ class OperationQueue:
                 await complete(job.result, propagate_cancel=False)
             except asyncio.CancelledError:
                 raise
-            except BaseException:
-                # Cancellation wins if the operation finished/failed concurrently.
-                pass
+            except BaseException as operation_error:
+                # Cancellation wins, but retain the operation's outcome and cleanup details.
+                raise cancelled from operation_error
             raise cancelled
 
     async def _work(self):

@@ -414,6 +414,7 @@ class CloudreveV4(Client):
         if previous is not None:
             body.update(previous=previous, entity_type='version')
         r = self.request('put', '/file/upload', json=body)
+        upload_acknowledged = False
         try:
             session_policy = r.get('storage_policy', policy)
             policy_type = session_policy['type']
@@ -428,14 +429,23 @@ class CloudreveV4(Client):
                 self._upload_to_onedrive(local_file=local_file, **r)
             else:
                 raise ValueError(f'存储策略 {policy_type} 暂时不受支持')
+            upload_acknowledged = True
             check_source_unchanged(local_file, stat)
             if self.get_info(uri)['size'] != size:
                 raise ValueError('Uploaded size differs from source')
         except BaseException as error:
             error.upload_session_id = r.get('session_id')
             error.upload_uri = uri
+            error.upload_session_expires = r.get('expires')
+            error.upload_acknowledged = upload_acknowledged
+            error.cleanup_acknowledged = None
+            # Cancellation cannot roll back an acknowledged upload.
+            if upload_acknowledged:
+                raise
+            error.cleanup_acknowledged = False
             try:
                 self.request('delete', '/file/upload', json={'id': r['session_id'], 'uri': uri})
+                error.cleanup_acknowledged = True
             except Exception as cleanup_error:
                 error.cleanup_error = cleanup_error
                 raise error from cleanup_error

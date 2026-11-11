@@ -155,10 +155,12 @@ class HTTPTests(unittest.TestCase):
                 self.assertEqual(self.server.counts['/api/v4/drop'], expected)
 
     def test_read_timeout_budget(self):
-        with patch('cloudreve.transport.time.sleep'):
+        with patch('cloudreve.transport.time.sleep'), \
+             patch.object(self.client.session, 'request', wraps=self.client.session.request) as request:
             with self.assertRaises(ReadTimeout):
                 self.client.request('get', '/slow', timeout=(1, 0.005))
-        self.assertEqual(self.server.counts['/api/v4/slow'], 3)
+        # A 5 ms timeout can precede the server thread accepting the last request.
+        self.assertEqual(request.call_count, 3)
 
     def test_business_error_and_protocol(self):
         with self.assertRaises(CloudreveError) as caught:
@@ -346,12 +348,14 @@ class UploadTests(unittest.TestCase):
             self.client.upload(self.file, '/file')
         self.assertEqual(self.client.request.call_count, 1)
 
-    def test_size_mismatch_cancels(self):
+    def test_size_mismatch_after_acknowledgement_does_not_cancel(self):
         self.client.get_info.return_value = {'size': 8}
         self.client.request = Mock(side_effect=[{'session_id': 'id', 'chunk_size': 0}, None, None])
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as caught:
             self.client.upload(self.file, '/file')
-        self.assertEqual(self.client.request.call_args.args[0], 'delete')
+        self.assertTrue(caught.exception.upload_acknowledged)
+        self.assertIsNone(caught.exception.cleanup_acknowledged)
+        self.assertEqual(self.client.request.call_count, 2)
 
     def test_unsupported_policy_before_session(self):
         self.policy['relay'] = False

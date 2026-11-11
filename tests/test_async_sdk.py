@@ -291,7 +291,7 @@ class AsyncTransferTests(unittest.IsolatedAsyncioTestCase):
         self.client.get_info.return_value = {'size': 9}
         with self.assertRaisesRegex(ValueError, 'size differs'):
             await self.client.upload(self.source, '/dir/file')
-        self.assertEqual(self.records[-1][0], 'DELETE')
+        self.assertFalse(any(r[0] == 'DELETE' for r in self.records))
         for policy in ({'id': 'p', 'type': 'oss'}, {'id': 'p', 'type': 'onedrive'}):
             self.client.list.return_value = {'storage_policy': policy}
             self.source.write_bytes(b'')

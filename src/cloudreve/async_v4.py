@@ -578,6 +578,7 @@ class AsyncCloudreveV4:
         if previous is not None:
             body.update(previous=previous, entity_type='version')
         session = await self.request('put', '/file/upload', json=body)
+        upload_acknowledged = False
         try:
             policy = session.get('storage_policy', policy)
             mode = policy['type']
@@ -586,20 +587,30 @@ class AsyncCloudreveV4:
             if mode not in ('local', 'remote', 'onedrive'):
                 raise ValueError(f'存储策略 {mode} 暂时不受支持')
             await self._upload_chunks(local_file, mode=mode, **session)
+            upload_acknowledged = mode != 'onedrive'
             check_source_unchanged(local_file, stat)
             if mode == 'onedrive':
                 await self.request('post', f"/callback/onedrive/{session['session_id']}/{session['callback_secret']}")
+                upload_acknowledged = True
             if (await self.get_info(uri))['size'] != size:
                 raise ValueError('Uploaded size differs from source')
         except BaseException as error:
             error.upload_session_id = session.get('session_id')
             error.upload_uri = uri
+            error.upload_session_expires = session.get('expires')
+            error.upload_acknowledged = upload_acknowledged
+            error.cleanup_acknowledged = None
+            # Cancellation cannot roll back an acknowledged upload.
+            if upload_acknowledged:
+                raise
+            error.cleanup_acknowledged = False
             try:
                 # Cleanup bypasses a failed refresh and is drained before cancellation returns.
                 await _complete(
                     self._api_request('delete', '/file/upload', skip_refresh=True,
                                       json={'id': session['session_id'], 'uri': uri}),
-                    propagate_cancel=not isinstance(error, asyncio.CancelledError))
+                    propagate_cancel=False)
+                error.cleanup_acknowledged = True
             except BaseException as cleanup_error:
                 error.cleanup_error = cleanup_error
                 raise error from cleanup_error

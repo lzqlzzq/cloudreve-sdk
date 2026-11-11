@@ -11,8 +11,12 @@ from requests.structures import CaseInsensitiveDict
 
 
 class CloudreveError(Exception):
-    def __init__(self, code, message='', data=None):
+    def __init__(self, code, message='', data=None, *, detail=None,
+                 correlation_id=None, aggregated_error=None):
         self.code, self.message, self.data = code, message, data
+        # Keep server diagnostics available without logging signed URLs in str(error).
+        self.detail, self.correlation_id = detail, correlation_id
+        self.aggregated_error = aggregated_error
         super().__init__(f'Cloudreve error code={code}' + (f': {message}' if message else ''))
 
 
@@ -41,7 +45,9 @@ def envelope_data(body):
     if not isinstance(body, dict) or type(body.get('code')) is not int:
         raise CloudreveProtocolError('Cloudreve response requires an integer code')
     if body['code'] != 0:
-        raise CloudreveError(body['code'], body.get('msg', ''), body.get('data'))
+        raise CloudreveError(body['code'], body.get('msg', ''), body.get('data'),
+                             detail=body.get('error'), correlation_id=body.get('correlation_id'),
+                             aggregated_error=body.get('aggregated_error'))
     return body.get('data')
 
 

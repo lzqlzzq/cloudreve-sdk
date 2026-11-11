@@ -182,9 +182,11 @@ class FileFaultTests(unittest.IsolatedAsyncioTestCase):
                             self.source.write_bytes(b'0123456789')
                             os.utime(self.source, ns=(stamp, stamp + 1_000_000))
                 with patch.object(self.client, '_upload_chunks', side_effect=changed):
-                    with self.assertRaises(ValueError):
+                    with self.assertRaises(ValueError) as caught:
                         await self.client.upload(self.source, '/file')
-                self.assertEqual(self.records[-1][0], 'DELETE')
+                # This tiny file fits in the read buffer; the server acknowledged it.
+                self.assertTrue(caught.exception.upload_acknowledged)
+                self.assertFalse(any(r[0] == 'DELETE' for r in self.records))
 
     async def test_compressed_download_checks_decoded_content(self):
         class Stream(httpx.AsyncByteStream):
@@ -217,7 +219,7 @@ class FileFaultTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SyncSourceMutationTests(unittest.TestCase):
-    def test_sync_upload_reports_source_mutation_and_cleans_session(self):
+    def test_sync_upload_reports_source_mutation_without_cancelling_completed_upload(self):
         from cloudreve import CloudreveV4
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory, CloudreveV4(trust_env=False) as client:
@@ -229,7 +231,9 @@ class SyncSourceMutationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Source file changed') as caught:
                 client.upload(source, '/file')
             self.assertEqual(caught.exception.upload_session_id, 's')
-            self.assertEqual(client.request.call_args.args, ('delete', '/file/upload'))
+            self.assertTrue(caught.exception.upload_acknowledged)
+            self.assertIsNone(caught.exception.cleanup_acknowledged)
+            self.assertEqual(client.request.call_count, 1)
 
 
 class BoundaryTests(unittest.IsolatedAsyncioTestCase):

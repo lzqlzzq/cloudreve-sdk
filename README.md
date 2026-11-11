@@ -74,7 +74,8 @@ with CloudreveV4(
 - V4 登录后按 `access_expires` 提前 30 秒刷新，多个线程只触发一次自动刷新；支持 Go 纳秒时间格式。刷新失败不会由排队线程再次发送，先停止 worker 并重新登录。没有过期时间的手工 token 需调用方管理；401 不会触发写请求重放。SDK 不保存密码，不持久化 token，也不提供重启续传。
 - 仅 GET/HEAD 对连接错误、超时和 HTTP 429/502/503/504 有限重试；指数退避加抖动，`Retry-After` 等待上限 30 秒。证书错误、业务错误、其它 HTTP 错误不重试。POST/PUT/PATCH/DELETE、创建上传会话、上传块、回调和刷新均不自动重试。下载响应体开始读取后发生中断，不自动重下；目标文件保持原样。
 - HTTP 错误保留 `requests.HTTPError`，网络错误保留 requests 异常；业务错误统一为 `CloudreveError`（含 `code`、`message`、`data`），无效 JSON / 缺少整数业务码为 `CloudreveProtocolError`。批量部分成功也抛业务异常并保留 `data`，不是事务回滚。不要无过滤记录完整异常 response、token、签名 URL 或服务端敏感数据。
-- V4 已知会话上传失败会尽力取消，原异常保留 `upload_session_id`、`upload_uri`；取消失败另带 `cleanup_error`。创建会话响应丢失时拿不到 ID，无法取消；已完成写入的响应丢失也可能表现为失败。先查远端内容／版本再决定是否重试，不能把超时当作未写入。进程被杀、机器重启时无法保证清理，遗留会话由服务端过期机制处理。
+- V4 已知会话、尚未收到上传完成确认时，失败会尽力取消一次；已确认完成后校验失败则不取消，取消并不是回滚。异常保留 `upload_session_id`、`upload_uri`、`upload_session_expires`（服务端 Unix 秒时间戳）、`upload_acknowledged`。`cleanup_acknowledged` 为 `None` 表示未取消、`True` 表示取消 API 返回成功、`False` 表示未确认成功并附带 `cleanup_error`；即使为 `True` 也不证明文件已删除或 OSS 分片已清空。创建会话响应丢失时拿不到 ID，无法取消；上传响应丢失也可能已完成写入，先核对远端内容／版本再决定是否重试。进程被杀、机器重启时无法保证清理，会话 TTL 也不等于 OSS 对象／分片的清理保证。
+- `CloudreveError` 保留 `code`、`message`、`data`，并提供 `correlation_id`、`detail`（服务端 `error` 字段）、`aggregated_error`。生产服务可能只返回错误码和关联 ID；SDK 不推测被隐藏的错误原因。`detail` 可能包含存储路径或签名信息，默认异常字符串不会拼入它。
 - `upload(..., previous=primary_entity)` 和 `update_file_content(..., previous=primary_entity)` 可做条件覆盖；不传 `previous` 的文本更新保持原有无条件覆盖语义。并发覆盖可能返回锁冲突 `40073` 或旧版本 `40076`，由调用方重新读取并决定，不做盲目重试。多个下载写入同一本地路径是最后一次原子替换胜出，应使用不同目标文件。
 - 上传按实际存储策略分流。relay 的 `chunk_size=0` 流式发送整文件，包含空文件；正分片大小按顺序上传，策略的 `chunk_concurrency` 不会让 SDK 擅自并行 relay 分片。多文件并发由线程池控制。OSS 直传仍未开放；OneDrive 直传空文件在创建会话前拒绝。从机上传只携带会话提供的从机凭据。
 - SDK 不根据 `internal` 字样猜测路由，不改写签名 URL，也不会在内网失败后切到公网。API 固定配置 origin，默认拒绝重定向。下载采用独立无 CR 鉴权的 Session；`allow_external_downloads=True`（兼容默认值）允许返回的外部存储 URL，但仍不自动重定向。签名传输禁用 netrc／环境代理，只沿用显式 `proxy` 和 `verify`；如需自定义 CA，显式传 `verify='/path/to/ca.pem'`。
@@ -123,7 +124,7 @@ asyncio.run(main())
 - GET/HEAD 有限重试，等待可取消；TLS 证书错误、业务错误和写请求不重试，不跟随重定向。HTTP/网络异常分别为 `httpx.HTTPStatusError` / `httpx.RequestError` 子类；业务异常沿用 `CloudreveError`、`CloudreveProtocolError`。共享路径编码、令牌解析和分页兼容逻辑。
 - token 刷新是鉴权请求的 barrier：暂停新的鉴权请求，等待在途鉴权请求结束，独占刷新后放行；多个刷新需求合并。不会等待整项上传结束，因此长操作可以在两个接口之间刷新，避免队列死锁。签名传输不使用登录 token。刷新请求失败或中途取消后不自动重发，应重新登录；只是在等在途请求时取消、尚未发出刷新，则不会把 token 标记为不确定。
 - 排队时取消不会发请求；执行中取消保留 `CancelledError`，已知上传会话尽力取消一次，等待清理结束后再返回。重复 `cancel()` 不会留下无人等待的清理任务。下载在原子替换前取消或断流会保留旧目标并删除临时文件；提交完成后的取消不会回滚。进行中的磁盘操作结束后才关闭文件。
-- 普通上传失败的异常携带 `upload_session_id`、`upload_uri`，清理失败附带 `cleanup_error`。Python 3.8 的 Task 不保留这些取消详情，需在直接调用 SDK 的协程内部捕获；Python 3.10 中信息可能位于 `__context__` 原异常链。创建会话的响应丢失时无法取得 ID；进程被杀也无法保证清理。实际部署取消接口可能返回 `code=-1`，SDK 不会把它吞掉或当作清理成功，详见验证记录。
+- 上传异常的会话信息、`upload_acknowledged`、`cleanup_acknowledged` 和 `cleanup_error` 与同步版一致。跨 Task／`wait_for` 边界时，Python 3.8–3.9 可能丢弃取消详情，需在直接调用 SDK 的协程内部捕获；较新版本也应检查 `__context__`／`__cause__` 原异常链。上传先失败而清理期间又取消时，对外取消异常通过 `__cause__` 保留原失败。创建会话响应丢失时无法取得 ID；进程被杀也无法保证清理。实际部署取消接口返回 `-1` 时，SDK 不吞掉、不自动重试，也不把文件路径消失当作清理成功。实测的缓存会话、数据库记录、OSS 分片／对象及定时回收结果见 [取消上传调查](docs/cancellation/README.md)。
 - API 固定配置 origin；不会内网失败后切到公网。下载和直传使用独立客户端，不携带 Cloudreve headers、cookies，禁用环境代理，保留显式 `proxy` / `verify`；从机上传只使用上传凭据。`proxy` 支持 URL 或 `{'http': ..., 'https': ...}`。`trust_env=False` 不会绕开操作系统 TUN；`allow_external_downloads=False` 仅限制 URL origin，不能证明整个网络链路都在内网。
 
 新增完整故障矩阵、40 组并发交错、120 秒压力测试和独立 256 MiB 断流测试，见 [并发与容错补测](docs/resilience/README.md)。独立运行：`uv run --with-editable . python -m experiments.large_transfer --size-mib 256 --output /tmp/cloudreve-large.json`。上传源文件的身份、大小或修改时间发生变化时会报错；这不保证远端尚未写入。
